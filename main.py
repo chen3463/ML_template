@@ -295,6 +295,58 @@ def evaluate_model(clf, X_test, y_test):
     plt.legend()
     plt.show()
 
+import optuna
+
+def run_optuna_optimization(
+    objective_fn,
+    n_trials=50,
+    timeout=None,
+    direction="maximize",
+    sampler_seed=42,
+    study_name="optuna_study",
+    storage=None,  # e.g., "sqlite:///optuna.db"
+    load_if_exists=True,
+    show_progress_bar=True,
+    verbosity=1
+):
+    """
+    General-purpose Optuna runner for hyperparameter tuning.
+
+    Parameters:
+        objective_fn (function): The Optuna objective function to optimize
+        n_trials (int): Number of Optuna trials
+        timeout (int or None): Time limit in seconds
+        direction (str): "maximize" or "minimize"
+        sampler_seed (int): Random seed for sampler
+        study_name (str): Name of the Optuna study
+        storage (str or None): e.g., "sqlite:///optuna.db" for persistence
+        load_if_exists (bool): Load existing study from storage if it exists
+        show_progress_bar (bool): Whether to show Optuna progress bar
+        verbosity (int): Print summary if > 0
+
+    Returns:
+        study (optuna.Study): The completed Optuna study
+    """
+
+    sampler = optuna.samplers.TPESampler(seed=sampler_seed)
+    study = optuna.create_study(
+        direction=direction,
+        study_name=study_name,
+        sampler=sampler,
+        storage=storage,
+        load_if_exists=load_if_exists,
+    )
+
+    study.optimize(objective_fn, n_trials=n_trials, timeout=timeout, show_progress_bar=show_progress_bar)
+
+    if verbosity:
+        print(f"\n✅ Best {direction} score: {study.best_value:.4f}")
+        print("✅ Best parameters:")
+        for k, v in study.best_params.items():
+            print(f"   - {k}: {v}")
+
+    return study
+
 def run_pipeline(filepath, target_col, sep=',', split_method="random", model_type="xgb", date_col=None, params=None):
     df = load_data(filepath, sep)
     visualize_data(df, target_col)
@@ -329,3 +381,45 @@ if __name__ == "__main__":
 
     # df = load_data(filepath, ';')
     # visualize_data(df, target_col)
+
+from xgboost import XGBClassifier
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+X_train, X_val, y_train, y_val = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+
+def objective(trial):
+    params = {
+        "max_depth": trial.suggest_int("max_depth", 3, 10),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+        "n_estimators": 1000,
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+        "use_label_encoder": False,
+        "objective": "binary:logistic",
+        "eval_metric": "auc"
+    }
+
+    model = XGBClassifier(**params)
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        early_stopping_rounds=20,
+        verbose=False
+    )
+
+    y_pred = model.predict_proba(X_val)[:, 1]
+    score = roc_auc_score(y_val, y_pred)
+    return score
+
+# Run tuning
+study = run_optuna_optimization(
+    objective_fn=objective,
+    n_trials=30,
+    direction="maximize"
+)
+
