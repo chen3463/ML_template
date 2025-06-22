@@ -1,102 +1,83 @@
-# ML Interview Craft Exercise Template
+# ML Interview Craft Exercise Template (Jupyter Friendly)
 # Author: Qimeng Chen
-# Purpose: Reusable pipeline for classification problems (90-minute exercise)
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import warnings
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (classification_report, confusion_matrix,
-                             roc_auc_score, roc_curve, accuracy_score)
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+                             roc_auc_score, roc_curve)
+from sklearn.preprocessing import (StandardScaler, MinMaxScaler,
+                                   OneHotEncoder, LabelEncoder)
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
 
 import xgboost as xgb
 import lightgbm as lgb
 import shap
-import warnings
+import optuna
+
 warnings.filterwarnings("ignore")
 
-# -----------------------------
-# 1. Load and Explore Data
-# -----------------------------
-def load_data(filepath, sep= ','):
-    df = pd.read_csv(filepath, sep = sep)
-    print(df.head())
-    print(df.info())
-    print(df.describe())
+# ----------------------------------------
+# Data Loading and Visualization
+# ----------------------------------------
+def load_data(filepath, sep=','):
+    df = pd.read_csv(filepath, sep=sep)
+    display(df.head())
+    display(df.info())
+    display(df.describe())
     return df
 
-
-import seaborn as sns
-import matplotlib.pyplot as plt
-import pandas as pd
-
 def visualize_data(df, target_col, max_categories=10):
-    print("\n=== Starting Data Visualization ===")
-    # Target Distribution
-    print("\n--- Visualizing Target Distribution ---")
+    print("\n=== Data Visualization ===")
+
     sns.countplot(data=df, x=target_col)
-    plt.title("Target Variable Distribution")
+    plt.title("Target Distribution")
     plt.show()
 
-    # Correlation Heatmap
-    print("\n--- Correlation Heatmap ---")
     plt.figure(figsize=(12, 8))
     corr = df.select_dtypes(include=['int64', 'float64']).corr()
     sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f")
-    plt.title("Feature Correlation")
+    plt.title("Correlation Heatmap")
     plt.show()
 
-    # Numerical Feature Distributions
-    print("\n--- Numerical Feature Distributions ---")
     num_features = df.select_dtypes(include=['int64', 'float64']).columns.drop(target_col, errors='ignore')
     df[num_features].hist(bins=30, figsize=(15, 10))
     plt.tight_layout()
     plt.show()
 
-    # Target vs Numerical Feature Boxplots
-    print("\n--- Target vs Numerical Feature Boxplots ---")
     for col in num_features:
         sns.boxplot(data=df, x=target_col, y=col)
-        plt.title(f'{col} vs. {target_col}')
+        plt.title(f'{col} vs {target_col}')
         plt.tight_layout()
         plt.show()
 
-    # Target vs Numerical Feature KDEs
-    print("\n--- KDE Plot of Numerical Features by Target ---")
     for col in num_features:
         plt.figure(figsize=(8, 5))
         for cls in df[target_col].unique():
             subset = df[df[target_col] == cls]
-            sns.kdeplot(subset[col], label=f"{target_col} = {cls}", fill=True, common_norm=False, alpha=0.5)
-        plt.title(f'Distribution of {col} by {target_col}')
-        plt.xlabel(col)
-        plt.ylabel('Density')
+            sns.kdeplot(subset[col], label=f"{target_col}={cls}", fill=True, common_norm=False, alpha=0.5)
+        plt.title(f'{col} Distribution by {target_col}')
         plt.legend()
         plt.tight_layout()
         plt.show()
-    # Categorical Feature Distributions
-    print("\n--- Categorical Feature Distributions ---")
+
     cat_features = df.select_dtypes(include=['object', 'category']).columns
     for col in cat_features:
         top_cats = df[col].value_counts().nlargest(max_categories)
         sns.barplot(x=top_cats.index, y=top_cats.values)
-        plt.title(f'{col} (Top {max_categories} Categories)')
+        plt.title(f'{col} (Top {max_categories})')
         plt.xticks(rotation=45)
         plt.tight_layout()
         plt.show()
 
-    # Target vs Categorical Feature
-    print("\n--- Target vs Categorical Feature Breakdown ---")
-
-    for col in cat_features:
         if df[col].nunique() <= max_categories:
             sns.countplot(data=df, x=col, hue=target_col)
             plt.title(f'{col} by {target_col}')
@@ -104,167 +85,85 @@ def visualize_data(df, target_col, max_categories=10):
             plt.tight_layout()
             plt.show()
 
-# -----------------------------
-# 2. Preprocess Data
-# -----------------------------
-from sklearn.preprocessing import OneHotEncoder, LabelEncoder
-
+# ----------------------------------------
+# Preprocessing and Utilities
+# ----------------------------------------
 def create_categorical_encoder(X_train, encoding_type="onehot", drop_first=False):
-    """
-    Create and fit a categorical encoder.
-
-    Parameters:
-        X_train (DataFrame): Input features
-        encoding_type (str): 'onehot' or 'label'
-        drop_first (bool): Whether to drop the first category (for one-hot)
-
-    Returns:
-        encoder: fitted encoder(s)
-        cat_cols: list of categorical columns
-    """
     cat_cols = X_train.select_dtypes(include=["object", "category"]).columns.tolist()
-
     if encoding_type == "onehot":
         encoder = OneHotEncoder(handle_unknown="ignore", drop="first" if drop_first else None)
         encoder.fit(X_train[cat_cols])
         return encoder, cat_cols
-
     elif encoding_type == "label":
-        encoder = {}
-        for col in cat_cols:
-            le = LabelEncoder()
-            le.fit(X_train[col].astype(str))  # Ensure consistent str type
-            encoder[col] = le
+        encoder = {col: LabelEncoder().fit(X_train[col].astype(str)) for col in cat_cols}
         return encoder, cat_cols
-
     else:
         raise ValueError("encoding_type must be 'onehot' or 'label'")
 
-
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-
-
 def create_numeric_scaler(X_train, method="standard"):
-    """
-    Fit a scaler on numeric columns.
-
-    method: 'standard' or 'minmax'
-    """
     num_cols = X_train.select_dtypes(include=["int64", "float64"]).columns.tolist()
-
-    if method == "standard":
-        scaler = StandardScaler()
-    elif method == "minmax":
-        scaler = MinMaxScaler()
-    else:
-        raise ValueError("method must be 'standard' or 'minmax'")
-
+    scaler = StandardScaler() if method == "standard" else MinMaxScaler()
     scaler.fit(X_train[num_cols])
     return scaler, num_cols
-
-
-def transform_numeric(scaler, X, num_cols):
-    return scaler.transform(X[num_cols])
-
-from sklearn.model_selection import train_test_split
 
 def split_data(df, target_col, method="random", date_col=None,
                train_size=0.7, val_size=0.15, test_size=0.15,
                stratify=False, time_boundaries=None, random_state=42):
-    """
-    Split data into train/val/test using either random or time-based logic.
-
-    Parameters:
-        df (pd.DataFrame): Full dataset including target
-        target_col (str): Name of the target column
-        method (str): "random" or "time"
-        date_col (str): Name of datetime column (required for time-based split)
-        train_size, val_size, test_size: Must sum to 1.0
-        stratify (bool): Stratify target in random split
-        time_boundaries (tuple): (train_end_date, val_end_date) if using specific cutoff dates
-        random_state (int): Random seed
-
-    Returns:
-        (X_train, y_train, X_val, y_val, X_test, y_test)
-    """
-    assert abs(train_size + val_size + test_size - 1.0) < 1e-6, "Splits must sum to 1.0"
-
+    assert abs(train_size + val_size + test_size - 1.0) < 1e-6
     if method == "random":
         X = df.drop(columns=[target_col])
         y = df[target_col]
         stratify_y = y if stratify else None
-
-        X_train_val, X_test, y_train_val, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=stratify_y)
-
+        X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=test_size,
+                                                                    random_state=random_state,
+                                                                    stratify=stratify_y)
         val_fraction = val_size / (train_size + val_size)
-        stratify_y = y_train_val if stratify else None
-
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_train_val, y_train_val, test_size=val_fraction,
-            random_state=random_state, stratify=stratify_y)
-
-    elif method == "time":
-        assert date_col is not None, "date_col is required for time-based split"
+        X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=val_fraction,
+                                                          random_state=random_state,
+                                                          stratify=y_train_val if stratify else None)
+    else:
         df_sorted = df.sort_values(date_col).reset_index(drop=True)
-
-        if time_boundaries:  # Manual date boundaries
+        if time_boundaries:
             train_end, val_end = time_boundaries
-
             df_train = df_sorted[df_sorted[date_col] <= train_end]
-            df_val   = df_sorted[(df_sorted[date_col] > train_end) & (df_sorted[date_col] <= val_end)]
-            df_test  = df_sorted[df_sorted[date_col] > val_end]
-        else:  # Percentile-based
+            df_val = df_sorted[(df_sorted[date_col] > train_end) & (df_sorted[date_col] <= val_end)]
+            df_test = df_sorted[df_sorted[date_col] > val_end]
+        else:
             n = len(df_sorted)
             train_idx = int(train_size * n)
-            val_idx   = int((train_size + val_size) * n)
-
+            val_idx = int((train_size + val_size) * n)
             df_train = df_sorted.iloc[:train_idx]
-            df_val   = df_sorted.iloc[train_idx:val_idx]
-            df_test  = df_sorted.iloc[val_idx:]
+            df_val = df_sorted.iloc[train_idx:val_idx]
+            df_test = df_sorted.iloc[val_idx:]
 
         X_train = df_train.drop(columns=[target_col, date_col])
         y_train = df_train[target_col]
-        X_val   = df_val.drop(columns=[target_col, date_col])
-        y_val   = df_val[target_col]
-        X_test  = df_test.drop(columns=[target_col, date_col])
-        y_test  = df_test[target_col]
-
-    else:
-        raise ValueError("method must be 'random' or 'time'")
+        X_val = df_val.drop(columns=[target_col, date_col])
+        y_val = df_val[target_col]
+        X_test = df_test.drop(columns=[target_col, date_col])
+        y_test = df_test[target_col]
 
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 def build_preprocessor(X_train):
     cat_encoder, cat_cols = create_categorical_encoder(X_train, encoding_type="onehot", drop_first=True)
-    num_scaler, num_cols = create_numeric_scaler(X_train, method="standard")
-
-    # Build preprocessing pipeline
-    preprocessor = ColumnTransformer(transformers=[
+    num_scaler, num_cols = create_numeric_scaler(X_train)
+    return ColumnTransformer([
         ("num", StandardScaler(), num_cols),
         ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"), cat_cols)
     ])
 
-    return preprocessor
-
-# -----------------------------
-# 3. Train Model
-# -----------------------------
+# ----------------------------------------
+# Model Training & Evaluation
+# ----------------------------------------
 def train_model(preprocessor, X_train, y_train, X_val, y_val, model_type="xgb", params=None):
-    if model_type == "xgb":
-        model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **(params or {}))
-    elif model_type == "logit":
-        model = LogisticRegression(max_iter=1000, **(params or {}))
-    elif model_type == "lgbm":
-        model = lgb.LGBMClassifier(**(params or {}))
-    else:
-        raise ValueError("Unsupported model_type. Choose from 'xgb', 'logit', 'lgbm'.")
+    model = {
+        "xgb": xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **(params or {})),
+        "logit": LogisticRegression(max_iter=1000, **(params or {})),
+        "lgbm": lgb.LGBMClassifier(**(params or {}))
+    }[model_type]
 
-    clf = Pipeline([
-        ('preprocessor', preprocessor),
-        ('classifier', model)
-    ])
-
+    clf = Pipeline([("preprocessor", preprocessor), ("classifier", model)])
     clf.fit(X_train, y_train)
     y_val_pred = clf.predict(X_val)
     y_val_prob = clf.predict_proba(X_val)[:, 1]
@@ -283,143 +182,94 @@ def evaluate_model(clf, X_test, y_test):
     print(classification_report(y_test, y_pred))
     print("Test ROC AUC:", roc_auc_score(y_test, y_prob))
 
-    cm = confusion_matrix(y_test, y_pred)
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    sns.heatmap(confusion_matrix(y_test, y_pred), annot=True, fmt="d", cmap="Blues")
     plt.title("Test Confusion Matrix")
     plt.show()
 
     fpr, tpr, _ = roc_curve(y_test, y_prob)
     plt.plot(fpr, tpr, label=f"AUC = {roc_auc_score(y_test, y_prob):.2f}")
     plt.plot([0, 1], [0, 1], linestyle='--')
-    plt.title("Test ROC Curve")
+    plt.title("ROC Curve")
     plt.legend()
     plt.show()
 
-import optuna
+# ----------------------------------------
+# SHAP Visualizations
+# ----------------------------------------
+def explain_with_shap(clf, X_sample):
+    model = clf.named_steps['classifier']
+    X_transformed = clf.named_steps['preprocessor'].transform(X_sample)
+    explainer = shap.Explainer(model)
+    shap_values = explainer(X_transformed)
+    shap.summary_plot(shap_values, features=X_transformed, feature_names=clf.named_steps['preprocessor'].get_feature_names_out())
 
-def run_optuna_optimization(
-    objective_fn,
-    n_trials=50,
-    timeout=None,
-    direction="maximize",
-    sampler_seed=42,
-    study_name="optuna_study",
-    storage=None,  # e.g., "sqlite:///optuna.db"
-    load_if_exists=True,
-    show_progress_bar=True,
-    verbosity=1
-):
-    """
-    General-purpose Optuna runner for hyperparameter tuning.
+# ----------------------------------------
+# Optuna Optimization Runner
+# ----------------------------------------
+def run_optuna_optimization(objective_fn, n_trials=30, direction="maximize"):
+    study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=True)
 
-    Parameters:
-        objective_fn (function): The Optuna objective function to optimize
-        n_trials (int): Number of Optuna trials
-        timeout (int or None): Time limit in seconds
-        direction (str): "maximize" or "minimize"
-        sampler_seed (int): Random seed for sampler
-        study_name (str): Name of the Optuna study
-        storage (str or None): e.g., "sqlite:///optuna.db" for persistence
-        load_if_exists (bool): Load existing study from storage if it exists
-        show_progress_bar (bool): Whether to show Optuna progress bar
-        verbosity (int): Print summary if > 0
-
-    Returns:
-        study (optuna.Study): The completed Optuna study
-    """
-
-    sampler = optuna.samplers.TPESampler(seed=sampler_seed)
-    study = optuna.create_study(
-        direction=direction,
-        study_name=study_name,
-        sampler=sampler,
-        storage=storage,
-        load_if_exists=load_if_exists,
-    )
-
-    study.optimize(objective_fn, n_trials=n_trials, timeout=timeout, show_progress_bar=show_progress_bar)
-
-    if verbosity:
-        print(f"\n✅ Best {direction} score: {study.best_value:.4f}")
-        print("✅ Best parameters:")
-        for k, v in study.best_params.items():
-            print(f"   - {k}: {v}")
+    print(f"\nBest {direction} score: {study.best_value:.4f}")
+    for k, v in study.best_params.items():
+        print(f"{k}: {v}")
 
     return study
 
-def run_pipeline(filepath, target_col, sep=',', split_method="random", model_type="xgb", date_col=None, params=None):
-    df = load_data(filepath, sep)
-    visualize_data(df, target_col)
+# ----------------------------------------
+# Sample Optuna Objective Function (XGBoost)
+# ----------------------------------------
+def make_optuna_objective(X_train, y_train, X_val, y_val):
+    def objective(trial):
+        params = {
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+            "n_estimators": 1000,
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+            "use_label_encoder": False,
+            "eval_metric": "auc",
+            "objective": "binary:logistic"
+        }
 
-    df = df.dropna(subset=[target_col])
-    if df[target_col].dtype == "object":
-        df[target_col] = df[target_col].map({'yes': 1, 'no': 0}).fillna(0).astype(int)
+        model = xgb.XGBClassifier(**params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=20, verbose=False)
+        y_val_pred = model.predict_proba(X_val)[:, 1]
+        return roc_auc_score(y_val, y_val_pred)
 
-    X_train, y_train, X_val, y_val, X_test, y_test = split_data(
-        df, target_col=target_col, method=split_method, date_col=date_col)
+    return objective
 
-    X_combined = pd.concat([X_train, X_val])
-    preprocessor = build_preprocessor(X_combined)
+# ---------------------------
+# Test Code for Full Pipeline
+# ---------------------------
+# Load and preprocess Bank Marketing Dataset (binary classification)
 
-    clf = train_model(preprocessor, X_train, y_train, X_val, y_val, model_type=model_type, params=params)
-    evaluate_model(clf, X_test, y_test)
-    # show_feature_importance(clf, X_test)
+# Download: https://archive.ics.uci.edu/ml/machine-learning-databases/00222/bank.zip
+# Use: "bank-full.csv" from the zip file
 
-    return clf
+# 1. Load Data
+df = load_data("bank-full.csv", sep=";")
+df['y'] = df['y'].map({'yes': 1, 'no': 0})
 
+# 2. Optional EDA
+visualize_data(df, target_col="y")
 
+# 3. Split
+X_train, y_train, X_val, y_val, X_test, y_test = split_data(df, target_col="y", method="random", stratify=True)
 
-# -----------------------------
-# 5. Run All
-# -----------------------------
-if __name__ == "__main__":
-    filepath = "bank-full.csv"
-    target_col = "y"
-    sep = ";"
-    model = run_pipeline(filepath, target_col, sep=sep, model_type="xgb")
+# 4. Preprocessor
+X_combined = pd.concat([X_train, X_val])  # to avoid unseen categories
+preprocessor = build_preprocessor(X_combined)
 
+# 5. Train Model
+clf = train_model(preprocessor, X_train, y_train, X_val, y_val, model_type="xgb")
 
-    # df = load_data(filepath, ';')
-    # visualize_data(df, target_col)
+# 6. Evaluate
+evaluate_model(clf, X_test, y_test)
 
-from xgboost import XGBClassifier
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
-import numpy as np
-
-X_train, X_val, y_train, y_val = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
-
-def objective(trial):
-    params = {
-        "max_depth": trial.suggest_int("max_depth", 3, 10),
-        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
-        "n_estimators": 1000,
-        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
-        "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
-        "use_label_encoder": False,
-        "objective": "binary:logistic",
-        "eval_metric": "auc"
-    }
-
-    model = XGBClassifier(**params)
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        early_stopping_rounds=20,
-        verbose=False
-    )
-
-    y_pred = model.predict_proba(X_val)[:, 1]
-    score = roc_auc_score(y_val, y_pred)
-    return score
-
-# Run tuning
-study = run_optuna_optimization(
-    objective_fn=objective,
-    n_trials=30,
-    direction="maximize"
-)
+# 7. SHAP Explanation (optional but informative)
+explain_with_shap(clf, X_test.sample(100, random_state=42))  # limit to 100 for speed
 
