@@ -95,10 +95,20 @@ def create_categorical_encoder(X_train, encoding_type="onehot", drop_first=False
         encoder.fit(X_train[cat_cols])
         return encoder, cat_cols
     elif encoding_type == "label":
-        encoder = {col: LabelEncoder().fit(X_train[col].astype(str)) for col in cat_cols}
+        encoder = {}
+        for col in cat_cols:
+            le = LabelEncoder()
+            le.fit(X_train[col].astype(str))
+            encoder[col] = le
         return encoder, cat_cols
     else:
         raise ValueError("encoding_type must be 'onehot' or 'label'")
+
+def transform_with_label_encoding(X, encoder_dict):
+    X_copy = X.copy()
+    for col, encoder in encoder_dict.items():
+        X_copy[col] = X_copy[col].astype(str).map(lambda val: encoder.transform([val])[0] if val in encoder.classes_ else -1)
+    return X_copy
 
 def create_numeric_scaler(X_train, method="standard"):
     num_cols = X_train.select_dtypes(include=["int64", "float64"]).columns.tolist()
@@ -156,23 +166,51 @@ def build_preprocessor(X_train):
 # ----------------------------------------
 # Model Training & Evaluation
 # ----------------------------------------
-def train_model(preprocessor, X_train, y_train, X_val, y_val, model_type="xgb", params=None):
-    model = {
-        "xgb": xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **(params or {})),
-        "logit": LogisticRegression(max_iter=1000, **(params or {})),
-        "lgbm": lgb.LGBMClassifier(**(params or {}))
-    }[model_type]
+def train_xgb_with_label_encoding(X_train, y_train, X_val, y_val, use_optuna=False, n_trials=30):
+    cat_encoder, cat_cols = create_categorical_encoder(X_train, encoding_type="label")
+    X_train_enc = transform_with_label_encoding(X_train, cat_encoder)
+    X_val_enc = transform_with_label_encoding(X_val, cat_encoder)
 
-    clf = Pipeline([("preprocessor", preprocessor), ("classifier", model)])
-    clf.fit(X_train, y_train)
-    y_val_pred = clf.predict(X_val)
-    y_val_prob = clf.predict_proba(X_val)[:, 1]
+    if use_optuna:
+        def objective(trial):
+            params = {
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+                "n_estimators": 1000,
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+                "use_label_encoder": True,
+                "eval_metric": "aucpr",
+                "early_stopping_rounds": 20
+            }
+            model = xgb.XGBClassifier(**params)
+            model.fit(X_train_enc, y_train,
+                      eval_set=[(X_val_enc, y_val)],
+                      verbose=False)
+            y_pred = model.predict_proba(X_val_enc)[:, 1]
+            return roc_auc_score(y_val, y_pred)
 
-    print("\n--- Validation Performance ---")
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=n_trials)
+        best_params = study.best_params
+        best_params["use_label_encoder"] = True
+        best_params["eval_metric"] = "aucpr"
+        model = xgb.XGBClassifier(**best_params)
+    else:
+        model = xgb.XGBClassifier(use_label_encoder=True, eval_metric='aucpr', early_stopping_rounds = 20)
+
+    model.fit(X_train_enc, y_train, eval_set=[(X_val_enc, y_val)], verbose=False)
+    y_val_pred = model.predict(X_val_enc)
+    y_val_prob = model.predict_proba(X_val_enc)[:, 1]
+
+    print("--- Validation Performance (Label Encoded) ---")
     print(classification_report(y_val, y_val_pred))
     print("Validation ROC AUC:", roc_auc_score(y_val, y_val_prob))
 
-    return clf
+    return model, cat_encoder
 
 def evaluate_model(clf, X_test, y_test):
     y_pred = clf.predict(X_test)
@@ -193,62 +231,16 @@ def evaluate_model(clf, X_test, y_test):
     plt.legend()
     plt.show()
 
-# ----------------------------------------
-# SHAP Visualizations
-# ----------------------------------------
 def explain_with_shap(clf, X_sample):
-    model = clf.named_steps['classifier']
-    X_transformed = clf.named_steps['preprocessor'].transform(X_sample)
+    import shap
+    print("--- SHAP Explanation ---")
+
+    model = clf
+    data = X_sample
     explainer = shap.Explainer(model)
-    shap_values = explainer(X_transformed)
-    shap.summary_plot(shap_values, features=X_transformed, feature_names=clf.named_steps['preprocessor'].get_feature_names_out())
-
-# ----------------------------------------
-# Optuna Optimization Runner
-# ----------------------------------------
-def run_optuna_optimization(objective_fn, n_trials=30, direction="maximize"):
-    study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=True)
-
-    print(f"\nBest {direction} score: {study.best_value:.4f}")
-    for k, v in study.best_params.items():
-        print(f"{k}: {v}")
-
-    return study
-
-# ----------------------------------------
-# Sample Optuna Objective Function (XGBoost)
-# ----------------------------------------
-def make_optuna_objective(X_train, y_train, X_val, y_val):
-    def objective(trial):
-        params = {
-            "max_depth": trial.suggest_int("max_depth", 3, 10),
-            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
-            "n_estimators": 1000,
-            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
-            "use_label_encoder": False,
-            "eval_metric": "auc",
-            "objective": "binary:logistic"
-        }
-
-        model = xgb.XGBClassifier(**params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=20, verbose=False)
-        y_val_pred = model.predict_proba(X_val)[:, 1]
-        return roc_auc_score(y_val, y_val_pred)
-
-    return objective
-
-# ---------------------------
-# Test Code for Full Pipeline
-# ---------------------------
-# Load and preprocess Bank Marketing Dataset (binary classification)
-
-# Download: https://archive.ics.uci.edu/ml/machine-learning-databases/00222/bank.zip
-# Use: "bank-full.csv" from the zip file
+    shap_values = explainer(data)
+    feature_names = model.get_booster().feature_names
+    shap.summary_plot(shap_values, features=data, feature_names=feature_names)
 
 # 1. Load Data
 df = load_data("bank-full.csv", sep=";")
@@ -261,15 +253,16 @@ visualize_data(df, target_col="y")
 X_train, y_train, X_val, y_val, X_test, y_test = split_data(df, target_col="y", method="random", stratify=True)
 
 # 4. Preprocessor
-X_combined = pd.concat([X_train, X_val])  # to avoid unseen categories
-preprocessor = build_preprocessor(X_combined)
+# X_combined = pd.concat([X_train, X_val])  # to avoid unseen categories
+# preprocessor = build_preprocessor(X_combined)
 
 # 5. Train Model
-clf = train_model(preprocessor, X_train, y_train, X_val, y_val, model_type="xgb")
+# clf = train_model(preprocessor, X_train, y_train, X_val, y_val, model_type="xgb")
+clf, encoder = train_xgb_with_label_encoding(X_train, y_train, X_val, y_val, use_optuna=True, n_trials=30)
 
 # 6. Evaluate
-evaluate_model(clf, X_test, y_test)
+X_test_enc = transform_with_label_encoding(X_test, encoder)
+evaluate_model(clf, X_test_enc, y_test)
 
 # 7. SHAP Explanation (optional but informative)
-explain_with_shap(clf, X_test.sample(100, random_state=42))  # limit to 100 for speed
-
+explain_with_shap(clf, X_test_enc.sample(100, random_state=42))  # limit to 100 for speed
